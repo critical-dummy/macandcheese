@@ -67,4 +67,4 @@ Mac&Cheese의 최종 목표는 `mnc-inspect`가 아니라, macOS 앱이 기대�
 
 ## 라이선스
 
-MIT License
+Mozilla Public License 2.0 (MPL-2.0). 자세한 조건은 [LICENSE](LICENSE)를 참조하세요.
