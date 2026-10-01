@@ -1,356 +1,70 @@
 # Mac&Cheese
 
-**A Windows-native macOS application compatibility framework/runtime.**
+Mac&Cheese는 Windows에서 macOS 애플리케이션이 기대하는 실행 환경을 재구현하는 **Windows-native compatibility framework/runtime**입니다. macOS 자체, 가상 머신, WSL, Hackintosh가 아닙니다.
 
-Mac&Cheese is an experimental C++ framework that aims to run macOS applications natively on Windows by reconstructing the execution environment those applications expect.
+## 0.2.0 현재 구현
 
-It is inspired by the idea behind Wine, but approaches the problem in the opposite direction:
+이번 릴리즈는 정적 분석/추출 단계에서 Windows-native Mach-O loading 준비 단계로 전진했습니다.
 
-> **macOS applications → Windows**
+- 64-bit little-endian Mach-O 및 FAT/universal 이미지 파싱
+- x86_64/arm64 slice 식별과 의존성·rpath 분석
+- UDIF/DMG, zlib 압축 extent, HFS+ 탐색·추출
+- Windows HANDLE 기반 Darwin/POSIX 정수 FD 테이블
+- Mach-O load plan과 `LC_MAIN` entry 계산
+- Windows `VirtualAlloc` 기반 segment mapping
+- dyld legacy rebase opcode 해석
+- x86_64 `LC_DYLD_CHAINED_FIXUPS` starts/rebase chain 해석
+- chained external bind가 필요한 경우 명시적 차단
+- dylib registry, `@rpath`, `@loader_path`, `@executable_path` 후보 해석
+- 제한된 Objective-C selector/class/category/protocol metadata 분석
+- 지원하지 않는 기능을 성공으로 가장하지 않는 진단 출력
 
-Mac&Cheese does **not** virtualize macOS, boot macOS, or emulate an entire Apple computer. Instead, the project progressively reconstructs the relevant binary, runtime, filesystem, and framework layers required by macOS applications.
+현재 ChatGPTInstaller 같은 최신 앱은 segment mapping과 chained rebase chain까지 진행되지만, `libSystem`, Objective-C, Swift, Foundation, AppKit 등의 **chained external symbol binding**이 필요하므로 실행은 아직 차단됩니다.
 
-## What is Mac&Cheese?
+## 빌드
 
-A macOS application is more than a `.app` directory.
+Windows 10/11에서 PowerShell로:
 
-Its executable may depend on:
-
-* Mach-O binaries
-* `dyld`
-* Objective-C runtime
-* Darwin/POSIX interfaces
-* system libraries
-* CoreFoundation
-* Foundation
-* graphics and text frameworks
-* application frameworks
-* resources stored inside macOS filesystem images
-
-Mac&Cheese works downward through these layers, identifying what an application actually depends on and rebuilding the necessary behavior on Windows.
-
-The goal is not to reproduce macOS visually.
-
-The goal is to reproduce the **execution environment** an application needs.
-
-## Current Architecture
-
-```text
-macOS Application
-        │
-        ▼
-    .app Bundle
-        │
-        ▼
-   Mach-O Executable
-        │
-        ├── Mach-O parser
-        ├── dyld / dylib resolution
-        ├── image loader
-        └── Objective-C metadata/runtime
-        │
-        ▼
- macOS-compatible runtime
-        │
-        ▼
- Windows
- ├── Win32
- ├── Direct3D
- └── DirectWrite
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\build-windows.ps1 -Clean
 ```
 
-Filesystem images are handled separately before the application bundle reaches the runtime:
-
-```text
-DMG
- │
- ├── UDIF
- │    ├── Trailer
- │    ├── XML property list
- │    └── blkx extents
- │
- └── Filesystem
-      ├── HFS+
-      └── APFS
-             │
-             ▼
-          .app bundle
-```
-
-## Implemented
-
-### Mach-O
-
-Mac&Cheese currently contains a native Mach-O parser supporting the structures needed for further loading work.
-
-Implemented/recognized structures include:
-
-* 64-bit Mach-O
-* x86_64
-* ARM64 identification
-* FAT / universal binaries
-* load commands
-* segments
-* sections
-* dynamic library dependencies
-* `@rpath` information
-* symbol tables
-* rebase information
-* bind information
-* weak bind information
-* lazy bind information
-* chained fixups metadata
-
-### Dynamic Libraries
-
-`DylibRegistry` provides the initial foundation for dynamic library loading and symbol resolution.
-
-It handles concepts such as:
-
-* image registration
-* install-name resolution
-* `@rpath`
-* search paths
-* library ordinals
-* symbol resolution
-
-### Native Image Loader
-
-The loader builds a `LoadPlan` from a Mach-O image and provides mapped-image handling.
-
-The current implementation includes:
-
-* segment mapping
-* load bias calculation
-* image address ranges
-* entry-point information
-* rebasing metadata
-* binding metadata
-* chained-fixup metadata
-* dependency tracking
-
-### Objective-C Runtime
-
-Mac&Cheese contains an initial Objective-C runtime representation.
-
-The current implementation includes:
-
-* selectors
-* classes
-* superclass relationships
-* methods
-* categories
-* protocols
-* Objective-C type-encoding classification
-* discovery of Objective-C metadata from mapped Mach-O sections
-
-Actual method/IMP registration and complete Objective-C ABI compatibility are still under development.
-
-### macOS Application Bundles
-
-The bundle inspector understands the basic structure of a macOS `.app` bundle, including:
-
-```text
-Application.app/
-└── Contents/
-    ├── Info.plist
-    ├── MacOS/
-    ├── Frameworks/
-    └── PlugIns/
-```
-
-It can locate the application executable and associated framework/plugin files.
-
-### DMG
-
-Mac&Cheese also contains a native DMG/UDIF reader.
-
-The implementation currently handles:
-
-* UDIF trailer detection
-* DMG metadata
-* XML property-list data
-* `blkx` block maps
-* logical sector mapping
-* raw/zero extents
-* zlib-compressed extents
-* filesystem probing
-
-This work originally became necessary while obtaining actual macOS application bundles for testing.
-
-### HFS+
-
-HFS+ support has progressed beyond simple filesystem detection.
-
-The implementation currently includes:
-
-* HFS+ volume header parsing
-* allocation block information
-* catalog B-tree discovery
-* catalog leaf nodes
-* file records
-* folder records
-* path reconstruction
-* file extents
-* file extraction
-* volume extraction
-
-This allows Mac&Cheese to recover actual files from supported DMG images, including application bundles.
-
-### APFS
-
-APFS support is currently at the probing stage.
-
-The implementation can investigate:
-
-* GPT partition maps
-* APFS partition candidates
-* APFS container `NXSB`
-* APFS block size
-
-Full APFS filesystem extraction is not implemented yet.
-
-## Project Status
-
-Mac&Cheese is **not finished**.
-
-The project is currently building the lower layers required before a real macOS application can execute successfully.
-
-The current direction is approximately:
-
-```text
-[Done / In Progress]
-
-DMG / UDIF
-    ↓
-HFS+
-    ↓
-.app bundle
-    ↓
-Mach-O
-    ↓
-dyld / dylibs
-    ↓
-image loader
-    ↓
-Objective-C runtime
-    ↓
-Darwin / POSIX
-    ↓
-CoreFoundation / Foundation
-    ↓
-graphics / text frameworks
-    ↓
-AppKit
-    ↓
-Windows backend
-    ↓
-macOS application execution
-```
-
-Not every layer shown above is implemented yet.
-
-## Design Principles
-
-### Native
-
-Mac&Cheese is written as a native Windows C++ project.
-
-The project does not depend on a web application layer for its runtime.
-
-### Reconstruct the behavior, not the appearance
-
-Mac&Cheese does not attempt to make Windows *look* like macOS.
-
-Instead, it studies the structures and behaviors that macOS applications depend on and reconstructs those requirements in a Windows environment.
-
-### Progressive implementation
-
-The project is intentionally built layer by layer.
-
-When one layer exposes another dependency, that dependency becomes the next implementation target.
-
-## Build
-
-Mac&Cheese currently targets:
-
-* Windows 10 / 11
-* x86-64
-* C++17
-* MSVC
-* CMake
-
-The repository includes a Windows build script:
+일반적인 반복 빌드:
 
 ```powershell
 .\build-windows.ps1
 ```
 
-The project produces components including:
+스크립트는 Visual Studio 18 2026/Visual Studio 17 2022, MinGW Makefiles, Ninja를 자동 탐색하고 Release 빌드와 CTest를 실행합니다.
 
-```text
-mnc_core.lib
-mnc-run.exe
-mnc-inspect.exe
-mnc-tests.exe
+## 사용
+
+```powershell
+.\build\Release\mnc-inspect.exe "Application.app"
+.\build\Release\mnc-run.exe --diagnose "Application.app"
+.\build\Release\mnc-run.exe --diagnose "disk.dmg"
+.\build\Release\mnc-run.exe --extract "disk.dmg" "C:\Temp\extracted"
 ```
 
-## Tools
+진단 명령은 아직 구현되지 않은 기능을 명확히 보고합니다. `--diagnose`가 성공했다고 해서 앱 코드가 실행되었다는 뜻은 아닙니다.
 
-### `mnc-inspect`
-
-Inspect a Mach-O executable or application bundle.
+## 현재 차단 지점
 
 ```text
-mnc-inspect <Mach-O-file|Application.app>
+DMG/HFS+ 읽기                         구현
+Mach-O segment mapping                구현
+legacy dyld rebase                    구현
+x86_64 chained rebase                 구현
+chained external bind                 진행 중
+Objective-C full objc_msgSend ABI    진행 중
+Swift runtime                         미구현
+Foundation/AppKit Windows backend     미구현
+실제 macOS 앱 lifecycle 실행          차단
 ```
 
-### `mnc-run`
+Mac&Cheese의 최종 목표는 `mnc-inspect`가 아니라, macOS 앱이 기대하는 ABI/API와 의미론을 유지하면서 Windows-native backend 위에서 앱 lifecycle을 유지하는 subsystem입니다.
 
-The runtime entry point for preparing and eventually launching macOS applications.
+## 라이선스
 
-### Tests
-
-The project uses CTest for automated tests.
-
-## What Mac&Cheese Is Not
-
-Mac&Cheese is not:
-
-* macOS
-* a macOS virtual machine
-* Hackintosh
-* a full Apple hardware emulator
-* a macOS installer
-* a `.app` to `.exe` converter
-* a web-based macOS simulator
-
-It is a **compatibility framework/runtime**.
-
-## Name
-
-The name is intentionally a wordplay:
-
-**Mac + Cheese = Mac&Cheese**
-
-The project name is not intended to describe the underlying architecture.
-
-## License
-
-Mac&Cheese is distributed under the **Mozilla Public License 2.0 (MPL-2.0)**.
-
-See [`LICENSE`](LICENSE) for the complete license text.
-
-## Development
-
-Mac&Cheese is an ongoing experimental project.
-
-The implementation is expected to change substantially as additional parts of the macOS application environment are reconstructed.
-
-The repository represents the actual implementation and current development state of the project.
-
----
-
-**Mac&Cheese**
-
-*macOS applications, reconstructed for Windows.*
+MIT License

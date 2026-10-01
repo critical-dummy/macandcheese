@@ -146,8 +146,10 @@ bool apply_chained_rebases(void* allocation, const LoadPlan& plan, const std::ve
     const auto base = reinterpret_cast<std::uintptr_t>(allocation);
     const auto slide = static_cast<std::int64_t>(static_cast<std::uint64_t>(base) - plan.image_min_address);
     for (std::uint32_t segment_index = 0; segment_index < segment_count; ++segment_index) {
-        const auto info_offset = read32(starts_offset + 4 + std::size_t(segment_index) * 4);
-        if (info_offset == 0) continue;
+        const auto relative_info_offset = read32(starts_offset + 4 + std::size_t(segment_index) * 4);
+        if (relative_info_offset == 0) continue;
+        if (starts_offset > bytes.size() - relative_info_offset) { error = "chained segment starts offset overflows fixups blob"; return false; }
+        const auto info_offset = starts_offset + relative_info_offset;
         if (info_offset + 22 > bytes.size()) { error = "chained segment starts record is truncated"; return false; }
         const auto size = read32(info_offset);
         const auto page_size = read16(info_offset + 4);
@@ -157,7 +159,7 @@ bool apply_chained_rebases(void* allocation, const LoadPlan& plan, const std::ve
         if (size < 22 || info_offset + size > bytes.size() || info_offset + 22 + std::size_t(page_count) * 2 > bytes.size()) { error = "invalid chained segment starts record"; return false; }
         if (pointer_format != 2 && pointer_format != 6) { error = "unsupported chained pointer format for x86_64: " + std::to_string(pointer_format); return false; }
         const SegmentMapping* segment = nullptr;
-        for (const auto& candidate : plan.segments) if (candidate.command_index == segment_index) { segment = &candidate; break; }
+        for (const auto& candidate : plan.segments) if (candidate.command_index == segment_index || candidate.file_offset == segment_offset) { segment = &candidate; break; }
         if (!segment) { error = "chained fixups references an unmapped segment"; return false; }
         for (std::uint16_t page = 0; page < page_count; ++page) {
             const auto page_start = read16(info_offset + 22 + std::size_t(page) * 2);
@@ -241,7 +243,7 @@ LoadPlan make_load_plan(const std::filesystem::path& executable, const MachOImag
         else plan.unresolved_dependencies.push_back(dependency);
     }
     if (plan.bind_size != 0 || plan.weak_bind_size != 0 || plan.lazy_bind_size != 0) plan.diagnostics.push_back("dyld bind streams present; symbol binding is not performed by the mapper");
-    if (plan.chained_fixups_size != 0) plan.diagnostics.push_back("dyld chained fixups present; chained pointer rebasing/binding is not performed by the mapper");
+    if (plan.chained_fixups_size != 0) plan.diagnostics.push_back("dyld chained fixups present; x86_64 rebase chains are supported, chained external binding remains required");
     plan.valid = true;
     plan.diagnostics.push_back("validated segment mapping plan; no pages mapped and no code executed");
     return plan;
@@ -326,6 +328,15 @@ MappedImage MappedImage::map_file(const std::filesystem::path& executable, const
             auto* destination = reinterpret_cast<std::byte*>(base + (segment.vm_address - plan.image_min_address));
             std::copy(bytes.begin(), bytes.end(), reinterpret_cast<char*>(destination));
         }
+    }
+    if (plan.chained_fixups_size != 0) {
+        if (plan.file_base_offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) - plan.chained_fixups_offset) { mapped.result_.error = "chained fixups offset exceeds stream limits"; mapped.reset(); return mapped; }
+        std::vector<std::uint8_t> fixups(plan.chained_fixups_size);
+        input.clear(); input.seekg(static_cast<std::streamoff>(plan.file_base_offset + plan.chained_fixups_offset));
+        input.read(reinterpret_cast<char*>(fixups.data()), static_cast<std::streamsize>(fixups.size()));
+        if (input.gcount() != static_cast<std::streamsize>(fixups.size())) { mapped.result_.error = "short read while loading chained fixups"; mapped.reset(); return mapped; }
+        std::string fixup_error;
+        if (!apply_chained_rebases(mapped.allocation_, plan, fixups, fixup_error)) { const auto diagnostic = "dyld chained fixups failed: " + fixup_error; mapped.reset(); mapped.result_.error = diagnostic; return mapped; }
     }
     if (plan.rebase_size != 0) {
         if (plan.file_base_offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) - plan.rebase_offset) {

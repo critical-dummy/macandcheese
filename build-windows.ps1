@@ -29,14 +29,17 @@ $cmakeArgs = @('-S', '.', '-B', $buildDir, '-DMNC_BUILD_TESTS=ON')
 $buildConfigArgs = @()
 $testConfigArgs = @()
 
-$vswhereCandidates = @(
-    (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'),
-    (Join-Path ${env:ProgramFiles} 'Microsoft Visual Studio\Installer\vswhere.exe')
-)
+$vswhereCandidates = @()
+if (${env:ProgramFiles(x86)}) { $vswhereCandidates += (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe') }
+if (${env:ProgramFiles}) { $vswhereCandidates += (Join-Path ${env:ProgramFiles} 'Microsoft Visual Studio\Installer\vswhere.exe') }
 $vswhere = $vswhereCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 $vsInstallPath = ''
 if ($vswhere) {
     $vsInstallPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Out-String).Trim()
+}
+if (-not $vsInstallPath) {
+    $knownBuildTools = Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio\*\BuildTools' -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($knownBuildTools) { $vsInstallPath = $knownBuildTools.FullName }
 }
 $vsInstalled = $vsInstallPath -and (Test-Path $vsInstallPath)
 
