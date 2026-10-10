@@ -50,6 +50,8 @@ struct BindReference {
     std::size_t segment_index{};
     std::uint64_t segment_offset{};
     std::int64_t addend{};
+    bool chained{false};
+    bool weak{false};
 };
 
 LoadPlan make_load_plan(const std::filesystem::path& executable, const MachOImage& image);
@@ -60,6 +62,7 @@ struct MappingResult {
     std::uint64_t load_bias{};
     std::string error;
     std::vector<BindReference> bind_references;
+    std::vector<std::string> binding_diagnostics;
 };
 
 class MappedImage {

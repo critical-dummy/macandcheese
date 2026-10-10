@@ -129,6 +129,7 @@ LaunchReport CompatibilityRuntime::prepare(const std::filesystem::path& input) c
                     }
                     if (!images.front().apply_bindings(registry, executable)) report.diagnostics.push_back("dyld non-lazy binding blocked: " + images.front().result().error);
                     else report.diagnostics.push_back("dyld non-lazy binding applied; lazy binding remains deferred");
+                    report.diagnostics.insert(report.diagnostics.end(), images.front().result().binding_diagnostics.begin(), images.front().result().binding_diagnostics.end());
                 }
             }
         }

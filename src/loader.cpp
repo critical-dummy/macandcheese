@@ -134,12 +134,43 @@ bool collect_bind_stream(const std::string& stream_name, const std::vector<std::
     return true;
 }
 
-bool apply_chained_rebases(void* allocation, const LoadPlan& plan, const std::vector<std::uint8_t>& bytes, std::string& error) {
+bool apply_chained_rebases(void* allocation, const LoadPlan& plan, const std::vector<std::uint8_t>& bytes, std::vector<BindReference>& bind_references, std::string& error) {
     if (bytes.size() < 28) { error = "chained fixups header is truncated"; return false; }
     const auto read16 = [&](std::size_t p) { return std::uint16_t(bytes[p]) | (std::uint16_t(bytes[p + 1]) << 8); };
     const auto read32 = [&](std::size_t p) { return std::uint32_t(bytes[p]) | (std::uint32_t(bytes[p + 1]) << 8) | (std::uint32_t(bytes[p + 2]) << 16) | (std::uint32_t(bytes[p + 3]) << 24); };
     const auto read64 = [&](std::size_t p) { return std::uint64_t(read32(p)) | (std::uint64_t(read32(p + 4)) << 32); };
     const auto starts_offset = read32(4);
+    const auto imports_offset = read32(8);
+    const auto symbols_offset = read32(12);
+    const auto imports_count = read32(16);
+    const auto imports_format = read32(20);
+    if (imports_count > 1u << 20 || imports_offset >= bytes.size() || symbols_offset >= bytes.size()) { error = "chained imports or symbols table is outside the fixups blob"; return false; }
+    if (imports_format != 1 && imports_format != 2 && imports_format != 3) { error = "unsupported chained imports format: " + std::to_string(imports_format); return false; }
+    struct Import { std::int64_t ordinal{}; bool weak{}; std::string symbol; std::int64_t addend{}; };
+    std::vector<Import> imports;
+    imports.reserve(imports_count);
+    const auto read_import = [&](std::size_t position, Import& result) -> bool {
+        if (position + 4 > bytes.size()) return false;
+        const auto packed = read32(position);
+        result.ordinal = static_cast<std::int8_t>(packed & 0xffu);
+        result.weak = (packed & 0x100u) != 0;
+        const auto name_offset = packed >> 9;
+        if (symbols_offset > bytes.size() - name_offset) return false;
+        const auto name_start = std::size_t(symbols_offset) + name_offset;
+        auto name_end = name_start;
+        while (name_end < bytes.size() && bytes[name_end] != 0) ++name_end;
+        if (name_end == bytes.size()) return false;
+        result.symbol.assign(reinterpret_cast<const char*>(bytes.data() + name_start), name_end - name_start);
+        if (imports_format == 2) { if (position + 8 > bytes.size()) return false; result.addend = static_cast<std::int32_t>(read32(position + 4)); }
+        else if (imports_format == 3) { if (position + 12 > bytes.size()) return false; result.addend = static_cast<std::int64_t>(read64(position + 4)); }
+        return true;
+    };
+    const auto import_stride = imports_format == 1 ? std::size_t(4) : imports_format == 2 ? std::size_t(8) : std::size_t(16);
+    for (std::uint32_t index = 0; index < imports_count; ++index) {
+        Import item;
+        if (imports_offset > bytes.size() - std::size_t(index) * import_stride || !read_import(std::size_t(imports_offset) + std::size_t(index) * import_stride, item)) { error = "invalid chained import entry"; return false; }
+        imports.push_back(std::move(item));
+    }
     if (starts_offset >= bytes.size() || starts_offset + 4 > bytes.size()) { error = "chained starts offset is outside the fixups blob"; return false; }
     const auto segment_count = read32(starts_offset);
     if (segment_count > 4096 || starts_offset + 4 + std::size_t(segment_count) * 4 > bytes.size()) { error = "invalid chained segment count"; return false; }
@@ -170,11 +201,18 @@ bool apply_chained_rebases(void* allocation, const LoadPlan& plan, const std::ve
             if (location < base || location + sizeof(std::uint64_t) > segment_end) { error = "chained pointer location is outside segment"; return false; }
             for (;;) {
                 const auto raw = *reinterpret_cast<std::uint64_t*>(location);
-                if ((raw >> 63) != 0) { error = "chained bind pointer encountered; chained bind resolver is not implemented"; return false; }
+                if ((raw >> 63) != 0) {
+                    const auto import_index = static_cast<std::uint32_t>(raw & 0x00ffffffu);
+                    if (import_index >= imports.size()) { error = "chained bind import ordinal is outside the imports table"; return false; }
+                    const auto raw_addend = static_cast<std::int8_t>((raw >> 24) & 0xffu);
+                    const auto& import = imports[import_index];
+                    bind_references.push_back({"chained-bind", import.symbol, import.ordinal, segment->command_index, static_cast<std::uint64_t>(location - (base + (segment->vm_address - plan.image_min_address))), import.addend + raw_addend, true, import.weak});
+                } else {
                 const auto target = raw & 0x0000000fffffffffULL;
                 const auto high8 = (raw >> 36) & 0xffULL;
                 const auto value = pointer_format == 6 ? static_cast<std::uint64_t>(base) + target : (target | (high8 << 56));
                 *reinterpret_cast<std::uint64_t*>(location) = pointer_format == 6 ? value : static_cast<std::uint64_t>(static_cast<std::int64_t>(value) + slide);
+                }
                 const auto next = (raw >> 51) & 0x7ffULL;
                 if (next == 0) break;
                 location += next * 4;
@@ -336,7 +374,7 @@ MappedImage MappedImage::map_file(const std::filesystem::path& executable, const
         input.read(reinterpret_cast<char*>(fixups.data()), static_cast<std::streamsize>(fixups.size()));
         if (input.gcount() != static_cast<std::streamsize>(fixups.size())) { mapped.result_.error = "short read while loading chained fixups"; mapped.reset(); return mapped; }
         std::string fixup_error;
-        if (!apply_chained_rebases(mapped.allocation_, plan, fixups, fixup_error)) { const auto diagnostic = "dyld chained fixups failed: " + fixup_error; mapped.reset(); mapped.result_.error = diagnostic; return mapped; }
+        if (!apply_chained_rebases(mapped.allocation_, plan, fixups, mapped.result_.bind_references, fixup_error)) { const auto diagnostic = "dyld chained fixups failed: " + fixup_error; mapped.reset(); mapped.result_.error = diagnostic; return mapped; }
     }
     if (plan.rebase_size != 0) {
         if (plan.file_base_offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) - plan.rebase_offset) {
@@ -397,12 +435,24 @@ bool MappedImage::apply_bindings(const mnc::dyld::DylibRegistry& registry, const
     for (const auto& reference : result_.bind_references) {
         if (reference.stream == "lazy-bind") continue;
         const auto resolution = registry.resolve(reference.symbol, requesting_image, reference.library_ordinal);
-        if (!resolution.resolved) { result_.error = resolution.diagnostic; return false; }
+        const bool weak_unresolved = !resolution.resolved && reference.weak;
+        if (!resolution.resolved) {
+            if (weak_unresolved) {
+                // dyld's weak-import semantics leave an absent symbol as a null pointer.
+                result_.binding_diagnostics.push_back(reference.stream + " symbol '" + reference.symbol + "': weak-unresolved -> null");
+            } else {
+            result_.error = "required " + reference.stream + " symbol '" + reference.symbol + "' unresolved (library ordinal " + std::to_string(reference.library_ordinal) + "): " + resolution.diagnostic;
+            result_.binding_diagnostics.push_back(reference.stream + " symbol '" + reference.symbol + "': unresolved");
+            return false;
+            }
+        } else {
+            result_.binding_diagnostics.push_back(reference.stream + " symbol '" + reference.symbol + "': resolved by " + resolution.image_path.string());
+        }
         const SegmentMapping* segment = nullptr;
         for (const auto& candidate : plan_.segments) if (candidate.command_index == reference.segment_index) { segment = &candidate; break; }
         if (!segment || reference.segment_offset > segment->vm_size || segment->vm_size - reference.segment_offset < sizeof(std::uint64_t)) { result_.error = "bind location is outside a mapped segment: " + reference.symbol; return false; }
         const auto location = base + (segment->vm_address - plan_.image_min_address) + reference.segment_offset;
-        pending.push_back({location, static_cast<std::uint64_t>(static_cast<std::int64_t>(resolution.address) + reference.addend)});
+        pending.push_back({location, weak_unresolved ? 0 : static_cast<std::uint64_t>(static_cast<std::int64_t>(resolution.address) + reference.addend)});
     }
     for (const auto& item : pending) *reinterpret_cast<std::uint64_t*>(item.address) = item.value;
     return true;
