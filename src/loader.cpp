@@ -431,6 +431,8 @@ bool MappedImage::apply_bindings(const mnc::dyld::DylibRegistry& registry, const
     if (!result_.mapped) { result_.error = "cannot bind an image that is not mapped"; return false; }
     struct Pending { std::uintptr_t address; std::uint64_t value; };
     std::vector<Pending> pending;
+    bool required_unresolved = false;
+    std::string first_unresolved_error;
     const auto base = reinterpret_cast<std::uintptr_t>(allocation_);
     for (const auto& reference : result_.bind_references) {
         if (reference.stream == "lazy-bind") continue;
@@ -441,9 +443,11 @@ bool MappedImage::apply_bindings(const mnc::dyld::DylibRegistry& registry, const
                 // dyld's weak-import semantics leave an absent symbol as a null pointer.
                 result_.binding_diagnostics.push_back(reference.stream + " symbol '" + reference.symbol + "': weak-unresolved -> null");
             } else {
-            result_.error = "required " + reference.stream + " symbol '" + reference.symbol + "' unresolved (library ordinal " + std::to_string(reference.library_ordinal) + "): " + resolution.diagnostic;
-            result_.binding_diagnostics.push_back(reference.stream + " symbol '" + reference.symbol + "': unresolved");
-            return false;
+                const auto diagnostic = "required " + reference.stream + " symbol '" + reference.symbol + "' unresolved (library ordinal " + std::to_string(reference.library_ordinal) + "): " + resolution.diagnostic;
+                if (first_unresolved_error.empty()) first_unresolved_error = diagnostic;
+                result_.binding_diagnostics.push_back(reference.stream + " symbol '" + reference.symbol + "': unresolved");
+                required_unresolved = true;
+                continue;
             }
         } else {
             result_.binding_diagnostics.push_back(reference.stream + " symbol '" + reference.symbol + "': resolved by " + resolution.image_path.string());
@@ -454,6 +458,7 @@ bool MappedImage::apply_bindings(const mnc::dyld::DylibRegistry& registry, const
         const auto location = base + (segment->vm_address - plan_.image_min_address) + reference.segment_offset;
         pending.push_back({location, weak_unresolved ? 0 : static_cast<std::uint64_t>(static_cast<std::int64_t>(resolution.address) + reference.addend)});
     }
+    if (required_unresolved) { result_.error = first_unresolved_error + "; additional unresolved symbols were collected in binding_diagnostics"; return false; }
     for (const auto& item : pending) *reinterpret_cast<std::uint64_t*>(item.address) = item.value;
     return true;
 }
